@@ -77,7 +77,7 @@ def config(args: argparse.Namespace) -> dict:
     looked up by name when needed, so no client id is needed here.
     """
     load_dotenv(PROJECT_DIR / ".env")
-    host = os.environ.get("VCFA_HOST", "").strip()
+    host = (getattr(args, "host", None) or os.environ.get("VCFA_HOST", "")).strip()
     org = (getattr(args, "org", None) or "").strip()
     is_provider = not org
 
@@ -492,6 +492,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Shared by every command, so --org works after the command name:
     #   vcfa_sa.py create --org other-org --name my-svc
     org_opts = argparse.ArgumentParser(add_help=False)
+    org_opts.add_argument("--host", help="VCF Automation host name, e.g. automation.example.com "
+                                         "(default: VCFA_HOST)")
     org_opts.add_argument("--org", help="tenant org to act in (default: the provider org)")
     org_opts.add_argument("--admin-user", help="log in as this admin user (e.g. admin@System) instead of using a token; "
                                          "the password is taken from VCFA_PASSWORD or prompted for")

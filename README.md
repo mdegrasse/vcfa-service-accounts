@@ -5,11 +5,19 @@ Works for the provider org and for tenant orgs. Python 3.10+, standard library o
 
 ## Setup
 
+The `.env` file is optional. Every setting can be given on the command line instead:
+
+```sh
+./vcfa_sa.py list --host automation.example.com --admin-token YOUR_TOKEN
+```
+
+To keep the settings in a file, copy the template and fill it in:
+
 ```sh
 cp .env.example .env   # set VCFA_HOST and the admin credential
 ```
 
-`.env` is git-ignored. The script does not store tokens: refresh tokens are printed to stdout.
+`--host` overrides `VCFA_HOST`. `.env` is git-ignored. The script does not store tokens: refresh tokens are printed to stdout.
 
 ## Admin credential
 
