@@ -1,36 +1,61 @@
 # vcfa-service-accounts
 
-Creates VCF Automation tenant service accounts and gets their refresh tokens without
-using the GUI. Python 3.10+, standard library only.
+Creates VCF Automation service accounts and gets their refresh tokens without using the GUI.
+Works for the provider org and for tenant orgs. Python 3.10+, standard library only.
 
 ## Setup
 
 ```sh
-cp .env.example .env   # set VCFA_HOST, VCFA_ORG, VCFA_ADMIN_REFRESH_TOKEN
+cp .env.example .env   # set VCFA_HOST and the admin credential
 ```
 
-`.env` and `tokens/` are git-ignored. Tokens are stored with mode 0600.
+`.env` is git-ignored. The script does not store tokens: refresh tokens are printed to stdout.
+
+## Admin credential
+
+Commands that call the API need an admin credential. Use one of these:
+
+- **`VCFA_ADMIN_REFRESH_TOKEN`** in `.env`, or **`--admin-token`** on the command line. The value
+  can be an API refresh token (My Account > API Tokens), which is exchanged for a bearer token on
+  each run, or a bearer JWT (starts with `eyJ`), which is used as-is. A JWT expires after about an
+  hour, and the script stops with a clear message once it has passed.
+- **`--user`** (or `VCFA_USER`) logs in as a user, such as `admin@System`. The password comes from
+  `VCFA_PASSWORD` if set, otherwise a hidden prompt. It is never printed or put on the command line.
+  The script uses `/cloudapi/1.0.0/sessions` (tenant) or `/sessions/provider` (provider).
+
+`--user` and an admin token can't be used together. The credential must belong to the org being
+targeted.
+
+## Choosing the org
+
+Without `--org`, the provider org is used. `--org NAME` targets a tenant org.
+
+```sh
+./vcfa_sa.py create --name my-svc                     # provider org
+./vcfa_sa.py create --org planets --name my-svc       # tenant org
+```
 
 ## Usage
 
 ```sh
-./vcfa_sa.py create --name my-svc          # one step: register, rotation off, grant, print refresh token
-./vcfa_sa.py token                         # prints a valid access token (refreshes as needed)
-./vcfa_sa.py list                          # service accounts in the org
-./vcfa_sa.py login --client-id <id>        # re-run the device flow for an existing account
-./vcfa_sa.py status | refresh | logout
-./vcfa_sa.py rotation --name my-svc --off  # or --on, or --id <urn>
+./vcfa_sa.py create --name my-svc          # register, turn rotation off, grant, print refresh token
+./vcfa_sa.py list                          # service accounts visible to the credential
+./vcfa_sa.py delete --name my-svc          # asks to confirm; --yes skips it, --id <urn> also works
+./vcfa_sa.py whoami                        # user, org and roles behind the admin credential
 ```
 
-`create` does everything in one run and prints the new account's client ID and refresh token.
-The refresh token is also stored in `tokens/<org>_<client_id>.json`, so you don't need to copy it
-from the terminal. It prints the secret to stdout, so be careful where that output goes (shell
-history, logs, screen sharing). Require Rotation is turned off by default, so the refresh token
-stays valid. Pass `--keep-rotation` to leave it on.
+`create` does everything in one run and prints the refresh token.
 
-Use a token: `curl -H "Authorization: Bearer $(./vcfa_sa.py token)" https://$VCFA_HOST/...`
+Every account gets a role. By default that is System Administrator in the provider org and
+Organization Administrator in a tenant org. Use `--scope "<role name>"` to choose another role, for
+example `--scope "Organization Master Owner"`. Pick the least privilege the account needs. Nothing is saved to disk, so copy
+the token to wherever your automation keeps secrets. The output contains a live credential, so be
+careful where it goes (shell history, logs, screen sharing).
 
-### Self-signed certificates
+
+Require Rotation is always turned off, so the refresh token stays valid.
+
+## Self-signed certificates
 
 Every command accepts TLS options:
 
@@ -40,58 +65,42 @@ Every command accepts TLS options:
 ```
 
 Use `--ca-file` with the CA that signed the VCFA certificate. Certificate checking stays on.
-`--insecure` disables checking entirely, so use it only for a lab or to confirm a TLS problem.
-The two flags cannot be combined.
+`--insecure` disables checking entirely, so use it only for a lab. The two flags can't be combined.
 
-### Choosing the org
+## Permissions
 
-Every command takes `--org`. Without it, `VCFA_ORG` is used.
+The admin user needs the Service Account View right to list and create, and the Service Account
+Manage right to approve requests. `create` checks View access before it registers anything, so a
+missing right can't leave an orphaned account behind. If a 403 happens later, the error names both
+rights.
 
-```sh
-./vcfa_sa.py create --org other-org --name my-svc
-./vcfa_sa.py login  --org other-org --client-id <client-id>
-./vcfa_sa.py list   --org other-org
-```
+A service account session can only see and manage itself and the accounts it created. Use a user
+credential for create, list, and delete.
 
-Credentials are scoped to their org so a token is never sent to the wrong one:
-
-- `VCFA_CLIENT_ID` and `VCFA_ADMIN_REFRESH_TOKEN` apply only to the `VCFA_ORG` default.
-- For any other org, pass `--client-id` and set `VCFA_ADMIN_REFRESH_TOKEN_<ORG>`, where `<ORG>`
-  is the org name in uppercase with non-alphanumeric characters replaced by `_`
-  (for example `VCFA_ADMIN_REFRESH_TOKEN_OTHER_ORG` for `other-org`).
-- Tokens are stored per org and client: `tokens/<org>_<client_id>.json`.
-
-## API calls
+## Endpoints
 
 | Step | Request | Source |
 |---|---|---|
-| Create | `POST /oauth/tenant/{org}/register` (JSON body, `software_id`) | VCFA docs, provider-side register sample |
-| Device code | `POST /oauth/tenant/{org}/device_authorization`, form `client_id` | Org management docs |
+| Register | `POST /oauth/{tenant/<org>\|provider}/register`, JSON with `software_id` | Org management and provider docs |
+| Device code | `POST /oauth/{tenant/<org>\|provider}/device_authorization` | Org management docs |
 | Lookup | `POST /cloudapi/1.0.0/deviceLookup`, JSON `{"userCode": ...}`, returns 303 with the account in `Location` | Broadcom API reference |
 | Approve | `POST /cloudapi/1.0.0/deviceLookup/grant`, JSON `{"userCode": ...}`, 204 | Broadcom API reference |
-| Refresh token | `POST /oauth/tenant/{org}/token`, form `grant_type=urn:ietf:params:oauth:grant-type:device_code` | Org management docs |
-| Access token | `POST /oauth/tenant/{org}/token`, form `grant_type=refresh_token` | Org management docs |
-| List | `GET /cloudapi/1.0.0/serviceAccounts` | Broadcom API reference |
+| Refresh token | `POST /oauth/{tenant/<org>\|provider}/token`, device-code grant | Org management docs |
+| Admin bearer | `POST /oauth/{tenant/<org>\|provider}/token`, `grant_type=refresh_token` (admin token only) | Org management docs |
+| List | `GET /cloudapi/1.0.0/serviceAccounts?page=N&pageSize=32` | Broadcom API reference |
+| Read, update, delete | `GET`, `PUT`, `DELETE /cloudapi/1.0.0/serviceAccounts/{id}` | Broadcom API reference |
 
-Without `VCFA_ADMIN_REFRESH_TOKEN`, `login` prints the user code and waits for you to approve
-it in the GUI, which is the old manual step.
+Without an admin credential, `create` prints the user code and waits for you to approve it in the GUI.
 
 ## Unverified
 
 These came from the docs but have not been run against a live instance:
 
-- **Create body.** The docs only show the provider-side register body. `--scope` is passed
-  through as-is if you need it; the tenant role field is not documented.
+- **Create body.** The provider register body follows the docs sample, with the scope encoded as
+  `urn:vcloud:role:System%20Administrator`. The tenant role field is not documented. Use `--scope`
+  for a different role.
 - **Require Rotation.** Set through `PUT /cloudapi/1.0.0/serviceAccounts/{id}` with
-  `requireRotation: false` and `tokenRotation: NEVER`. The `ServiceAccount` schema documents these
-  fields, but they have not been checked against a live instance. The script reads the full
-  object, changes only these two fields, and PUTs it back, because the docs don't say whether PUT
-  is a partial update. If the server rejects that body, check the error for the read-only fields
-  it doesn't accept.
-- **Service account lookup.** The `ServiceAccount` schema has no client ID field. `create` finds
-  the new account by the software ID it sent, and `rotation` finds one by name. Both fail if the
-  match is not exactly one account.
-- **Admin rights.** The grant call's required role is not documented. It probably needs an org
-  admin.
-- **Revoke and delete.** `POST .../serviceAccounts/{id}/revoke` and `DELETE .../serviceAccounts/{id}`
-  exist in the reference but are not wrapped by this script yet.
+  `requireRotation: false` and `tokenRotation: NEVER`. The script reads the full object, changes
+  only these two fields, and PUTs it back.
+- **Revoke.** `POST .../serviceAccounts/{id}/revoke` exists in the reference but isn't wrapped yet.
+- **Delete and tokens.** The docs don't say whether deleting an account also revokes its tokens.

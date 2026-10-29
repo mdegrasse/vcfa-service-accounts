@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""Create, approve and token-manage VCF Automation tenant service accounts.
+"""Create and manage VCF Automation service accounts in the provider or a tenant org.
 
 Automates the flow that was previously done by hand in the GUI and Bruno:
 
   create    register, turn Require Rotation off, approve via API, print refresh token
   list      GET  /cloudapi/1.0.0/serviceAccounts         list service accounts
-  rotation  set Require Rotation on or off for an account
-  login     POST /oauth/tenant/{org}/device_authorization  request a device/user code
-            POST /cloudapi/1.0.0/deviceLookup/grant        approve it (was "Review Access Requests")
-            POST /oauth/tenant/{org}/token                 device-code grant -> refresh token
-  refresh   POST /oauth/tenant/{org}/token                 refresh_token grant
-  token     print a valid access token (refreshes if needed)
-  status    show what is stored (no secrets)
-  logout    delete the stored tokens
+  delete    delete a service account (asks for confirmation unless --yes)
 
-create, list and login's automatic approval need an admin credential:
-VCFA_ADMIN_REFRESH_TOKEN, an API token from My Account > API Tokens of an org admin.
-Without it, login falls back to printing the user code for manual approval in the GUI.
+One admin credential is used for create, list, and delete, and for the approval in create: an API
+refresh token or a bearer JWT (My Account > API Tokens), set as VCFA_ADMIN_REFRESH_TOKEN in .env or
+passed with --admin-token, or a --user login. Without one, create prints the user code for GUI approval.
 
 Configuration (environment variables, or a local .env file):
   VCFA_HOST                 e.g. automation.example.com (no scheme)
-  VCFA_ORG                  tenant/org name
-  VCFA_CLIENT_ID            client id of the service account (set after create)
-  VCFA_ADMIN_REFRESH_TOKEN  optional, see above
+  (no --org)                create or manage in the provider org (default)
+  --org NAME                create or manage in a tenant org
+  VCFA_ADMIN_REFRESH_TOKEN  admin API token (refresh token, or a bearer JWT) for the org you target
 """
 
 import argparse
+import base64
+import getpass
 import json
 import os
 import ssl
@@ -38,11 +33,9 @@ import uuid
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
-TOKEN_DIR = PROJECT_DIR / "tokens"
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 REFRESH_GRANT = "refresh_token"
 REQUEST_TIMEOUT = 30
-REFRESH_MARGIN_SECONDS = 60
 ACCEPT = "application/json;version=40.0"
 # Set by main() from --ca-file / --insecure. None means system trust store.
 SSL_CONTEXT: ssl.SSLContext | None = None
@@ -75,37 +68,40 @@ def load_dotenv(path: Path) -> None:
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def config(args: argparse.Namespace, need_client_id: bool = True) -> dict:
-    """Build the run configuration. --org/--client-id override the .env defaults.
+def config(args: argparse.Namespace) -> dict:
+    """Build the run configuration. Without --org the provider org is used.
 
-    VCFA_CLIENT_ID and VCFA_ADMIN_REFRESH_TOKEN belong to the default org (VCFA_ORG).
-    They are only used when that org is targeted, so a token for one org is never
-    sent to another. For any other org, use --client-id and VCFA_ADMIN_REFRESH_TOKEN_<ORG>.
+    One admin credential is used for whichever org is targeted: --user, --admin-token,
+    or VCFA_ADMIN_REFRESH_TOKEN from the environment or .env. It must belong to the org
+    being targeted. Service accounts are referred to by name; their client ids are
+    looked up by name when needed, so no client id is needed here.
     """
     load_dotenv(PROJECT_DIR / ".env")
     host = os.environ.get("VCFA_HOST", "").strip()
-    default_org = os.environ.get("VCFA_ORG", "").strip()
-    org = (args.org or default_org).strip()
-    is_default_org = org == default_org
+    org = (getattr(args, "org", None) or "").strip()
+    is_provider = not org
 
-    # create and list do not take --client-id, so read it with a default.
-    client_id = (getattr(args, "client_id", None) or (os.environ.get("VCFA_CLIENT_ID", "").strip() if is_default_org else "")).strip()
+    admin_refresh = (getattr(args, "admin_token", None) or os.environ.get("VCFA_ADMIN_REFRESH_TOKEN", "")).strip()
+    user = (getattr(args, "user", None) or os.environ.get("VCFA_USER", "")).strip()
+    if user and admin_refresh and getattr(args, "admin_token", None):
+        sys.exit("Use either --user (with a password) or an admin token, not both.")
 
-    admin_var = "VCFA_ADMIN_REFRESH_TOKEN_" + "".join(c if c.isalnum() else "_" for c in org.upper())
-    admin_refresh = os.environ.get(admin_var, "").strip()
-    if not admin_refresh and is_default_org:
-        admin_refresh = os.environ.get("VCFA_ADMIN_REFRESH_TOKEN", "").strip()
-
-    cfg = {"host": host, "org": org, "client_id": client_id, "admin_refresh": admin_refresh}
-    required = {"VCFA_HOST": host, "org (--org or VCFA_ORG)": org}
-    if need_client_id:
-        required["client id (--client-id or VCFA_CLIENT_ID)"] = client_id
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        sys.exit("Missing configuration: " + ", ".join(missing))
+    name = (getattr(args, "name", None) or "").strip()
+    cfg = {"host": host, "org": org, "name": name, "admin_refresh": admin_refresh, "user": user}
+    if not host:
+        sys.exit("Missing configuration: VCFA_HOST")
     if "://" in host:
         sys.exit("VCFA_HOST must be a bare host name, without https://")
     return cfg
+
+
+def org_label(cfg: dict) -> str:
+    return cfg["org"] or "provider"
+
+
+def oauth_path(cfg: dict) -> str:
+    """/oauth/provider for the provider org, /oauth/tenant/{org} for a tenant org."""
+    return f"/oauth/tenant/{cfg['org']}" if cfg["org"] else "/oauth/provider"
 
 
 def http(method: str, url: str, headers: dict, body: bytes | None = None) -> tuple[int, dict]:
@@ -193,24 +189,81 @@ def api(cfg: dict, method: str, path: str, bearer: str, body: dict | None = None
     return http(method, f"https://{cfg['host']}{path}", headers, data)
 
 
-def tenant_url(cfg: dict, endpoint: str) -> str:
-    return f"https://{cfg['host']}/oauth/tenant/{cfg['org']}/{endpoint}"
+def oauth_url(cfg: dict, endpoint: str) -> str:
+    return f"https://{cfg['host']}{oauth_path(cfg)}/{endpoint}"
 
 
 def fail(what: str, status: int, payload: dict) -> None:
     detail = payload.get("error_description") or payload.get("message") or payload.get("error") or ""
-    sys.exit(f"{what} failed ({status}): {detail}".rstrip(": ").rstrip())
+    msg = f"{what} failed ({status}): {detail}".rstrip(": ").rstrip()
+    if status == 403:
+        msg += ("\nThe admin token's user needs the Service Account View right (list, create) and "
+                "the Service Account Manage right (approve requests).")
+    sys.exit(msg)
 
 
 # --- admin credential -------------------------------------------------------
 
+def is_jwt(token: str) -> bool:
+    """Access tokens are JWTs (eyJ..., three dot-separated parts). API refresh tokens are not."""
+    return token.startswith("eyJ") and token.count(".") == 2
+
+
+def jwt_expiry(token: str) -> float | None:
+    """Return the exp claim of a JWT without verifying it. None if absent or unreadable."""
+    import base64
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return float(json.loads(base64.urlsafe_b64decode(payload)).get("exp"))
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def session_login(cfg: dict) -> str:
+    """Log in with a username and password and return the session token.
+
+    Uses POST /cloudapi/1.0.0/sessions (tenant) or /sessions/provider (provider) with basic
+    auth. The session token comes back in the X-VMWARE-VCLOUD-ACCESS-TOKEN response header.
+    The password is taken from VCFA_PASSWORD, or prompted for, and never printed.
+    """
+    password = os.environ.get("VCFA_PASSWORD") or getpass.getpass(f"Password for {cfg['user']}: ")
+    cred = base64.b64encode(f"{cfg['user']}:{password}".encode()).decode()
+    path = "/cloudapi/1.0.0/sessions" if cfg["org"] else "/cloudapi/1.0.0/sessions/provider"
+    headers = {"Authorization": f"Basic {cred}", "Accept": "application/*;version=9.0.0"}
+    req = urllib.request.Request(f"https://{cfg['host']}{path}", method="POST", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT, context=SSL_CONTEXT) as resp:
+            status, resp_headers, raw = resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        status, resp_headers, raw = exc.code, exc.headers, exc.read()
+    except urllib.error.URLError as exc:
+        sys.exit(f"Could not reach {path}: {exc.reason}")
+    token = resp_headers.get("X-VMWARE-VCLOUD-ACCESS-TOKEN")
+    if status != 200 or not token:
+        fail(f"Session login as {cfg['user']}", status, json.loads(raw) if raw[:1] == b"{" else {})
+    return token
+
+
 def admin_bearer(cfg: dict) -> str:
-    """Exchange the admin API token for a short-lived bearer token."""
-    if not cfg["admin_refresh"]:
-        sys.exit("This command needs VCFA_ADMIN_REFRESH_TOKEN (an org admin API token).")
-    status, payload = post_form(tenant_url(cfg, "token"), {
+    """Return a bearer token for the admin calls.
+
+    A JWT is used as-is, since it is already a bearer token. Anything else is treated as
+    an API refresh token and exchanged for a short-lived bearer token.
+    """
+    if cfg.get("user"):
+        return session_login(cfg)
+    token = cfg["admin_refresh"]
+    if not token:
+        sys.exit("This command needs an admin token (VCFA_ADMIN_REFRESH_TOKEN or --admin-token) or a --user login.")
+    if is_jwt(token):
+        exp = jwt_expiry(token)
+        if exp is not None and exp <= time.time():
+            sys.exit(f"The bearer token expired at {time.ctime(exp)}. Get a new one or use a refresh token.")
+        return token
+    status, payload = post_form(oauth_url(cfg, "token"), {
         "grant_type": REFRESH_GRANT,
-        "refresh_token": cfg["admin_refresh"],
+        "refresh_token": token,
     })
     if status != 200 or "access_token" not in payload:
         fail("Admin token exchange", status, payload)
@@ -219,49 +272,15 @@ def admin_bearer(cfg: dict) -> str:
 
 # --- token storage ----------------------------------------------------------
 
-def token_file(cfg: dict) -> Path:
-    # One file per org and client so several service accounts can coexist.
-    return TOKEN_DIR / f"{cfg['org']}_{cfg['client_id']}.json"
-
-
-def load_tokens(cfg: dict) -> dict | None:
-    path = token_file(cfg)
-    return json.loads(path.read_text()) if path.is_file() else None
-
-
-def save_tokens(cfg: dict, data: dict) -> None:
-    TOKEN_DIR.mkdir(mode=0o700, exist_ok=True)
-    # Create with 0600 so the secret is never world-readable, even briefly.
-    fd = os.open(token_file(cfg), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as fh:
-        json.dump(data, fh, indent=2)
-
-
-def store_token_response(cfg: dict, payload: dict, previous: dict | None = None) -> dict:
-    """Persist a token response, keeping the old refresh token if none was returned."""
-    refresh = payload.get("refresh_token") or (previous or {}).get("refresh_token")
-    if not refresh:
-        sys.exit("Token response contained no refresh_token; nothing stored.")
-    data = {
+def token_response(payload: dict) -> dict:
+    """Return the refresh token and access token from a token response. Nothing is stored."""
+    if not payload.get("refresh_token"):
+        sys.exit("Token response contained no refresh_token.")
+    return {
+        "refresh_token": payload["refresh_token"],
         "access_token": payload.get("access_token"),
-        "refresh_token": refresh,
-        "expires_at": time.time() + int(payload.get("expires_in", 0)),
+        "expires_in": payload.get("expires_in"),
     }
-    save_tokens(cfg, data)
-    return data
-
-
-def refresh_tokens(cfg: dict, stored: dict) -> dict:
-    if not stored.get("refresh_token"):
-        sys.exit("No stored refresh token. Run 'login' first.")
-    status, payload = post_form(tenant_url(cfg, "token"), {
-        "grant_type": REFRESH_GRANT,
-        "client_id": cfg["client_id"],
-        "refresh_token": stored["refresh_token"],
-    })
-    if status != 200 or "access_token" not in payload:
-        fail("Refresh", status, payload)
-    return store_token_response(cfg, payload, previous=stored)
 
 
 # --- commands ---------------------------------------------------------------
@@ -269,36 +288,39 @@ def refresh_tokens(cfg: dict, stored: dict) -> dict:
 def cmd_create(cfg: dict, args: argparse.Namespace) -> None:
     """Create a service account end to end and print its refresh token.
 
-    Steps: register, turn Require Rotation off, device flow with API approval, store the
-    refresh token. The register body follows the provider-side sample in the VCF Automation
+    Steps: register, turn Require Rotation off, device flow with API approval, print the
+    refresh token. Nothing is stored locally. The register body follows the provider-side sample in the VCF Automation
     docs (software_id marks a service account). The tenant-side scope/role field is not
     documented, so it is passed through only if --scope is given. Verify on first use.
     """
     bearer = admin_bearer(cfg)
+    # Check the token can read service accounts before registering anything. Otherwise a
+    # missing right fails after the account exists, leaving an orphaned account behind.
+    list_service_accounts(cfg, bearer)
     body = {
         "client_name": args.name,
         "software_id": args.software_id or str(uuid.uuid4()),
         "software_version": args.software_version,
         "client_uri": args.client_uri,
     }
-    if args.scope:
-        body["scope"] = args.scope
-    status, payload = post_form_json(cfg, f"/oauth/tenant/{cfg['org']}/register", bearer, body)
+    # Every account needs a role, or the GUI shows it blank. --scope takes a role name
+    # (encoded here) or a full urn:vcloud:role URN. Defaults: System Administrator for the
+    # provider, Organization Administrator for a tenant org.
+    role = args.scope or ("System Administrator" if not cfg["org"] else "Organization Administrator")
+    body["scope"] = role if role.startswith("urn:") else "urn:vcloud:role:" + urllib.parse.quote(role)
+    status, payload = post_form_json(cfg, f"{oauth_path(cfg)}/register", bearer, body)
     if status not in (200, 201) or "client_id" not in payload:
         fail("Create service account", status, payload)
     client_id = payload["client_id"]
-    if not args.keep_rotation:
-        # The register body has no rotation field, so turn it off on the new account.
-        # Looked up by the software_id we just sent, which is unique per account.
-        sa = find_service_account(cfg, bearer, software_id=body["software_id"])
-        set_require_rotation(cfg, bearer, sa["id"], required=False)
+    # Require Rotation is always turned off, so the refresh token stays valid. The register
+    # body has no rotation field, so the new account is found by the software_id sent above.
+    sa = find_service_account(cfg, bearer, software_id=body["software_id"])
+    set_require_rotation(cfg, bearer, sa["id"], required=False)
 
-    login_cfg = {**cfg, "client_id": client_id}
-    data = device_login(login_cfg, bearer)
+    data = device_login({**cfg, "client_id": client_id}, bearer)
     print(f"Service account '{args.name}' created and granted.")
     print(f"Client ID:     {client_id}")
     print(f"Refresh token: {data['refresh_token']}")
-    print(f"Stored in:     {token_file(login_cfg)}")
 
 
 def post_form_json(cfg: dict, path: str, bearer: str, body: dict) -> tuple[int, dict]:
@@ -307,18 +329,43 @@ def post_form_json(cfg: dict, path: str, bearer: str, body: dict) -> tuple[int, 
 
 
 def cmd_list(cfg: dict, _args: argparse.Namespace) -> None:
-    status, payload = api(cfg, "GET", "/cloudapi/1.0.0/serviceAccounts", admin_bearer(cfg))
-    if status != 200:
-        fail("List service accounts", status, payload)
-    print(json.dumps(payload, indent=2))
+    accounts, total = fetch_service_accounts(cfg, admin_bearer(cfg))
+    rows = [
+        (str(sa.get("name", "")), str(sa.get("status", "")),
+         "on" if sa.get("requireRotation") else "off",
+         str((sa.get("org") or {}).get("name", "")), str(sa.get("id", "")))
+        for sa in accounts
+    ]
+    headers = ("NAME", "STATUS", "ROTATION", "ORG", "ID")
+    # Size each column to its longest value so long names don't push the others out of line.
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h) for i, h in enumerate(headers)]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers).rstrip())
+    for row in rows:
+        print(fmt.format(*row).rstrip())
+    print(f"\nShowing {len(accounts)} of {total} service accounts.")
+    if total != len(accounts):
+        print("The server reports more accounts than were returned. Check the token's org and rights.")
+
+
+def fetch_service_accounts(cfg: dict, bearer: str) -> tuple[list[dict], int]:
+    """Fetch every page of service accounts. Returns (accounts, resultTotal reported by the server)."""
+    accounts: list[dict] = []
+    page, total = 1, None
+    while True:
+        status, payload = api(cfg, "GET", f"/cloudapi/1.0.0/serviceAccounts?page={page}&pageSize=32", bearer)
+        if status != 200:
+            fail("List service accounts", status, payload)
+        values = payload.get("values", []) if isinstance(payload, dict) else payload
+        total = payload.get("resultTotal", len(values)) if isinstance(payload, dict) else len(values)
+        accounts.extend(values)
+        if not values or len(accounts) >= total:
+            return accounts, total
+        page += 1
 
 
 def list_service_accounts(cfg: dict, bearer: str) -> list[dict]:
-    status, payload = api(cfg, "GET", "/cloudapi/1.0.0/serviceAccounts", bearer)
-    if status != 200:
-        fail("List service accounts", status, payload)
-    # The collection may come wrapped in "values" (CloudAPI style) or as a bare list.
-    return payload.get("values", []) if isinstance(payload, dict) else payload
+    return fetch_service_accounts(cfg, bearer)[0]
 
 
 def find_service_account(cfg: dict, bearer: str, *, name: str | None = None, software_id: str | None = None) -> dict:
@@ -350,30 +397,54 @@ def set_require_rotation(cfg: dict, bearer: str, sa_id: str, required: bool) -> 
     return updated
 
 
-def cmd_rotation(cfg: dict, args: argparse.Namespace) -> None:
+def jwt_claims(token: str) -> dict:
+    """Decode a JWT payload without verifying it. For troubleshooting only."""
+    import base64
+    payload = token.split(".")[1]
+    payload += "=" * (-len(payload) % 4)
+    return json.loads(base64.urlsafe_b64decode(payload))
+
+
+def cmd_whoami(cfg: dict, _args: argparse.Namespace) -> None:
+    """Show who the admin token belongs to, from the access token's claims.
+
+    Prints claim names and values except the token itself. Use it to compare two tokens.
+    """
+    claims = jwt_claims(admin_bearer(cfg))
+    for key in sorted(claims):
+        value = claims[key]
+        if isinstance(value, (list, dict)):
+            value = json.dumps(value)
+        print(f"{key:<24} {value}")
+
+
+def cmd_delete(cfg: dict, args: argparse.Namespace) -> None:
     bearer = admin_bearer(cfg)
-    if args.id:
-        sa_id = args.id
-    else:
-        sa_id = find_service_account(cfg, bearer, name=args.name)["id"]
-    updated = set_require_rotation(cfg, bearer, sa_id, required=args.on)
-    print(f"Require Rotation is now {'ON' if updated.get('requireRotation') else 'OFF'} for {updated.get('name')} ({sa_id})")
-
-
-def cmd_login(cfg: dict, _args: argparse.Namespace) -> None:
-    bearer = admin_bearer(cfg) if cfg["admin_refresh"] else None
-    device_login(cfg, bearer)
-    print(f"Logged in. Tokens stored in {token_file(cfg)}")
+    sa = {"id": args.id} if args.id else find_service_account(cfg, bearer, name=args.name)
+    label = args.name or sa["id"]
+    if not args.yes:
+        answer = input(f"Delete service account '{label}' ({sa['id']})? Type 'yes' to confirm: ")
+        if answer.strip().lower() != "yes":
+            sys.exit("Not deleted.")
+    path = f"/cloudapi/1.0.0/serviceAccounts/{urllib.parse.quote(sa['id'], safe=':')}"
+    status, payload = api(cfg, "DELETE", path, bearer)
+    if status == 202:
+        # Accepted but processed asynchronously; the account may still show for a moment.
+        print(f"Delete accepted for service account '{label}' ({sa['id']}). The server is processing it; run list to confirm.")
+        return
+    if status not in (200, 204):
+        fail("Delete service account", status, payload)
+    print(f"Deleted service account '{label}' ({sa['id']}).")
 
 
 def device_login(cfg: dict, bearer: str | None) -> dict:
-    """Device flow: request a user code, approve it, poll for the refresh token, store it.
+    """Device flow: request a user code, approve it, poll for the refresh token.
 
     With an admin bearer, the request is approved through the API. Without one, the
-    user code is printed for approval in the GUI. Returns the stored token data.
+    user code is printed for approval in the GUI. Returns the token data.
     """
     # 1. Ask for a device code and user code. The service account becomes "Requested".
-    status, dev = post_form(tenant_url(cfg, "device_authorization"), {"client_id": cfg["client_id"]})
+    status, dev = post_form(oauth_url(cfg, "device_authorization"), {"client_id": cfg["client_id"]})
     if status != 200 or "device_code" not in dev:
         fail("device_authorization", status, dev)
 
@@ -388,7 +459,7 @@ def device_login(cfg: dict, bearer: str | None) -> dict:
         print(f"Granted access for user code {dev['user_code']}.")
     else:
         uri = dev.get("verification_uri_complete") or dev.get("verification_uri")
-        print("No VCFA_ADMIN_REFRESH_TOKEN set. Approve this in the VCFA GUI:")
+        print("No admin API token set. Approve this in the VCFA GUI:")
         print(f"  URL:       {uri}")
         print(f"  User code: {dev.get('user_code')}")
 
@@ -398,60 +469,20 @@ def device_login(cfg: dict, bearer: str | None) -> dict:
     interval = int(dev.get("interval", 5))
     deadline = time.time() + int(dev.get("expires_in", 3600))
     while time.time() < deadline:
-        status, payload = post_form(tenant_url(cfg, "token"), {
+        status, payload = post_form(oauth_url(cfg, "token"), {
             "grant_type": DEVICE_GRANT,
             "client_id": cfg["client_id"],
             "device_code": dev["device_code"],
         })
         if status == 200 and "access_token" in payload:
-            return store_token_response(cfg, payload)
+            return token_response(payload)
         error = payload.get("error")
         if error == "slow_down":
             interval += 5
         elif error != "authorization_pending":
             fail(f"Device login ({error or 'unknown error'})", status, payload)
         time.sleep(interval)
-    sys.exit("Device code expired before approval. Run login again.")
-
-
-def cmd_refresh(cfg: dict, _args: argparse.Namespace) -> None:
-    stored = load_tokens(cfg)
-    if not stored:
-        sys.exit("No stored tokens. Run 'login' first.")
-    data = refresh_tokens(cfg, stored)
-    print(f"Refreshed access token, valid until {time.ctime(data['expires_at'])}")
-
-
-def cmd_token(cfg: dict, _args: argparse.Namespace) -> None:
-    stored = load_tokens(cfg)
-    if not stored:
-        sys.exit("No stored tokens. Run 'login' first.")
-    still_valid = stored.get("expires_at", 0) - REFRESH_MARGIN_SECONDS > time.time()
-    if stored.get("access_token") and still_valid:
-        print(stored["access_token"])
-        return
-    print(refresh_tokens(cfg, stored)["access_token"])
-
-
-def cmd_status(cfg: dict, _args: argparse.Namespace) -> None:
-    stored = load_tokens(cfg)
-    if not stored:
-        print(f"No tokens stored for org '{cfg['org']}' / client '{cfg['client_id']}'.")
-        return
-    remaining = int(stored.get("expires_at", 0) - time.time())
-    print(f"Org:           {cfg['org']}")
-    print(f"Client ID:     {cfg['client_id']}")
-    print("Refresh token: present")
-    print(f"Access token:  {'expired' if remaining <= 0 else f'expires in {remaining}s'}")
-
-
-def cmd_logout(cfg: dict, _args: argparse.Namespace) -> None:
-    path = token_file(cfg)
-    if path.is_file():
-        path.unlink()
-        print(f"Deleted {path}")
-    else:
-        print("Nothing to delete.")
+    sys.exit("Device code expired before approval. Run create again.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -459,14 +490,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # Shared by every command, so --org works after the command name:
-    #   vcfa_sa.py login --org other-org --client-id ...
+    #   vcfa_sa.py create --org other-org --name my-svc
     org_opts = argparse.ArgumentParser(add_help=False)
-    org_opts.add_argument("--org", help="tenant org to act in (default: VCFA_ORG)")
+    org_opts.add_argument("--org", help="tenant org to act in (default: the provider org)")
+    org_opts.add_argument("--user", help="log in as this user (e.g. admin@System) instead of using a token; "
+                                         "the password is taken from VCFA_PASSWORD or prompted for")
+    org_opts.add_argument("--admin-token", help="admin API token (default: VCFA_ADMIN_REFRESH_TOKEN); "
+                                                "prefer .env, as command-line args end up in shell history")
     tls = org_opts.add_argument_group("TLS")
     tls.add_argument("--ca-file", metavar="PATH", help="PEM CA certificate that signed the VCFA server (self-signed/private CA)")
     tls.add_argument("--insecure", action="store_true", help="skip TLS certificate verification (last resort)")
-    client_opts = argparse.ArgumentParser(add_help=False, parents=[org_opts])
-    client_opts.add_argument("--client-id", help="service account client id (default: VCFA_CLIENT_ID)")
 
     create = sub.add_parser("create", parents=[org_opts],
                             help="register, grant and print the refresh token of a new service account")
@@ -474,38 +507,26 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--software-id", help="UUID; generated if omitted")
     create.add_argument("--software-version")
     create.add_argument("--client-uri")
-    create.add_argument("--scope", help="role/scope to grant, if the tenant API accepts one")
-    create.add_argument("--keep-rotation", action="store_true", help="leave Require Rotation on (default: turn it off)")
+    create.add_argument("--scope", metavar="ROLE", help="role name, e.g. 'Organization Administrator' "
+                        "(default: System Administrator for provider, Organization Administrator for a tenant org)")
 
     sub.add_parser("list", parents=[org_opts], help="list service accounts")
+    sub.add_parser("whoami", parents=[org_opts], help="show the user and roles behind the admin token")
 
-    rotation = sub.add_parser("rotation", parents=[org_opts], help="turn Require Rotation on or off")
-    target = rotation.add_mutually_exclusive_group(required=True)
-    target.add_argument("--name", help="service account name")
-    target.add_argument("--id", help="service account id URN")
-    state = rotation.add_mutually_exclusive_group(required=True)
-    state.add_argument("--on", action="store_true", help="require refresh token rotation")
-    state.add_argument("--off", action="store_true", help="do not require rotation (refresh token stays valid)")
-    for name, help_text in [
-        ("login", "device flow: request, approve, store tokens"),
-        ("refresh", "refresh the stored access token"),
-        ("token", "print a valid access token"),
-        ("status", "show stored token state"),
-        ("logout", "delete stored tokens"),
-    ]:
-        sub.add_parser(name, parents=[client_opts], help=help_text)
+    delete = sub.add_parser("delete", parents=[org_opts], help="delete a service account")
+    dtarget = delete.add_mutually_exclusive_group(required=True)
+    dtarget.add_argument("--name", help="service account name")
+    dtarget.add_argument("--id", help="service account id URN")
+    delete.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+
     return parser
 
 
 COMMANDS = {
     "create": cmd_create,
     "list": cmd_list,
-    "rotation": cmd_rotation,
-    "login": cmd_login,
-    "refresh": cmd_refresh,
-    "token": cmd_token,
-    "status": cmd_status,
-    "logout": cmd_logout,
+    "delete": cmd_delete,
+    "whoami": cmd_whoami,
 }
 
 
@@ -515,9 +536,7 @@ def main() -> None:
     if args.ca_file and args.insecure:
         sys.exit("Use either --ca-file or --insecure, not both.")
     SSL_CONTEXT = make_ssl_context(args.ca_file, args.insecure)
-    # create and list only need the org and admin token, not a client id.
-    cfg = config(args, need_client_id=args.command not in ("create", "list", "rotation"))
-    COMMANDS[args.command](cfg, args)
+    COMMANDS[args.command](config(args), args)
 
 
 if __name__ == "__main__":
