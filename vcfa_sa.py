@@ -4,7 +4,7 @@
 Automates the flow that was previously done by hand in the GUI and Bruno:
 
   create    register, turn Require Rotation off, approve via API, print refresh token
-  list      GET  /cloudapi/1.0.0/serviceAccounts         list service accounts
+  list      list service accounts visible to the credential
   delete    delete a service account (asks for confirmation unless --yes)
 
 One admin credential is used for create, list, and delete, and for the approval in create: an API
