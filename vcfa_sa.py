@@ -12,7 +12,7 @@ refresh token or a bearer JWT (My Account > API Tokens), set as VCFA_ADMIN_REFRE
 passed with --admin-token, or an --admin-user login. Without one, create prints the user code for GUI approval.
 
 Configuration (environment variables, or a local .env file):
-  VCFA_HOST                 e.g. automation.example.com (no scheme)
+  VCFA_HOST                 e.g. vcfa.yourdomain.com (no scheme)
   (no --org)                create or manage in the provider org (default)
   --org NAME                create or manage in a tenant org
   VCFA_ADMIN_REFRESH_TOKEN  admin API token (refresh token, or a bearer JWT) for the org you target
@@ -492,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Shared by every command, so --org works after the command name:
     #   vcfa_sa.py create --org other-org --name my-svc
     org_opts = argparse.ArgumentParser(add_help=False)
-    org_opts.add_argument("--host", help="VCF Automation host name, e.g. automation.example.com "
+    org_opts.add_argument("--host", help="VCF Automation host name, e.g. vcfa.yourdomain.com "
                                          "(default: VCFA_HOST)")
     org_opts.add_argument("--org", help="tenant org to act in (default: the provider org)")
     org_opts.add_argument("--admin-user", help="log in as this admin user (e.g. admin@System) instead of using a token; "

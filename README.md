@@ -8,7 +8,7 @@ Works for the provider org and for tenant orgs. Python 3.10+, standard library o
 The `.env` file is optional. Every setting can be given on the command line instead:
 
 ```sh
-./vcfa_sa.py list --host automation.example.com --admin-token YOUR_TOKEN
+./vcfa_sa.py list --host vcfa.yourdomain.com --admin-token YOUR_TOKEN
 ```
 
 To keep the settings in a file, copy the template and fill it in:
@@ -45,23 +45,80 @@ Without `--org`, the provider org is used. `--org NAME` targets a tenant org.
 
 ## Usage
 
+`create` registers the account, turns Require Rotation off, approves the request through the API,
+and prints the client ID and refresh token. Nothing is saved to disk, so copy the token to wherever
+your automation keeps secrets. The output contains a live credential, so be careful where it goes
+(shell history, logs, screen sharing).
+
 ```sh
-./vcfa_sa.py create --name my-svc          # register, turn rotation off, grant, print refresh token
-./vcfa_sa.py list                          # service accounts visible to the credential
-./vcfa_sa.py delete --name my-svc          # asks to confirm; --yes skips it, --id <urn> also works
-./vcfa_sa.py whoami                        # user, org and roles behind the admin credential
+./vcfa_sa.py create --name my-svc                                  # provider org, token from .env
+./vcfa_sa.py create --name my-svc --admin-token YOUR_TOKEN         # provider org, token on the command line
+./vcfa_sa.py create --name my-svc --admin-user admin@System        # provider org, logs in (prompts for password)
+./vcfa_sa.py create --org planets --name my-svc --admin-token YOUR_TOKEN
+./vcfa_sa.py create --org planets --name my-svc --admin-user admin@Planets
 ```
 
-`create` does everything in one run and prints the refresh token.
-
 Every account gets a role. By default that is System Administrator in the provider org and
-Organization Administrator in a tenant org. Use `--scope "<role name>"` to choose another role, for
-example `--scope "Organization Master Owner"`. Pick the least privilege the account needs. Nothing is saved to disk, so copy
-the token to wherever your automation keeps secrets. The output contains a live credential, so be
-careful where it goes (shell history, logs, screen sharing).
+Organization Administrator in a tenant org. Use `--scope` to choose another role, given by name.
+Pick the least privilege the account needs.
 
+```sh
+./vcfa_sa.py create --org planets --name my-svc --scope "Organization Master Owner"
+./vcfa_sa.py create --name my-svc --scope "System Administrator"
+```
 
-Require Rotation is always turned off, so the refresh token stays valid.
+## Examples
+
+### Admin credentials
+
+```sh
+# Log in as a user. The password is prompted for, or read from VCFA_PASSWORD.
+./vcfa_sa.py list --admin-user admin@System
+./vcfa_sa.py list --org planets --admin-user admin@Planets
+
+# Pass a token for one command, without a .env file.
+./vcfa_sa.py list --host vcfa.yourdomain.com --admin-token YOUR_TOKEN
+
+# Set the password in the environment for a single command, without prompting.
+VCFA_PASSWORD='...' ./vcfa_sa.py list --admin-user admin@System
+```
+
+`--admin-user` and `--admin-token` can't be used together.
+
+### Listing and inspecting
+
+```sh
+./vcfa_sa.py list                                  # provider org
+./vcfa_sa.py list --org planets                    # tenant org
+./vcfa_sa.py whoami --admin-user admin@System      # which user and roles the credential has
+```
+
+`list` shows the accounts the credential can see. A service account token only sees the accounts it
+created, so use a user credential to see everything.
+
+### Deleting
+
+```sh
+./vcfa_sa.py delete --name my-svc                  # asks you to type "yes"
+./vcfa_sa.py delete --name my-svc --yes            # no prompt
+./vcfa_sa.py delete --id urn:vcloud:serviceAccount:<uuid> --yes
+./vcfa_sa.py delete --org planets --name my-svc --admin-user admin@Planets
+```
+
+Deletion may return 202, which means the server is processing it. Run `list` to confirm.
+
+### Certificates and hosts
+
+```sh
+./vcfa_sa.py list --ca-file /path/to/vcfa-ca.pem                # trust your private CA (preferred)
+./vcfa_sa.py list --insecure                                    # skip verification (prints a warning)
+./vcfa_sa.py create --host vcfa.yourdomain.com --ca-file ca.pem --name my-svc --admin-token YOUR_TOKEN
+```
+
+## Notes
+
+- Require Rotation is always turned off, so the refresh token stays valid.
+- The script does not store tokens. Refresh tokens are printed to stdout only.
 
 ## Self-signed certificates
 
