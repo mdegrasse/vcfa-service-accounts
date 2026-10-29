@@ -19,11 +19,11 @@ Commands that call the API need an admin credential. Use one of these:
   can be an API refresh token (My Account > API Tokens), which is exchanged for a bearer token on
   each run, or a bearer JWT (starts with `eyJ`), which is used as-is. A JWT expires after about an
   hour, and the script stops with a clear message once it has passed.
-- **`--user`** (or `VCFA_USER`) logs in as a user, such as `admin@System`. The password comes from
+- **`--admin-user`** (or `VCFA_ADMIN_USER`) logs in as an admin user, such as `admin@System`. The password comes from
   `VCFA_PASSWORD` if set, otherwise a hidden prompt. It is never printed or put on the command line.
   The script uses `/cloudapi/1.0.0/sessions` (tenant) or `/sessions/provider` (provider).
 
-`--user` and an admin token can't be used together. The credential must belong to the org being
+`--admin-user` and an admin token can't be used together. The credential must belong to the org being
 targeted.
 
 ## Choosing the org

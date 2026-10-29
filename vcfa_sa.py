@@ -9,7 +9,7 @@ Automates the flow that was previously done by hand in the GUI and Bruno:
 
 One admin credential is used for create, list, and delete, and for the approval in create: an API
 refresh token or a bearer JWT (My Account > API Tokens), set as VCFA_ADMIN_REFRESH_TOKEN in .env or
-passed with --admin-token, or a --user login. Without one, create prints the user code for GUI approval.
+passed with --admin-token, or an --admin-user login. Without one, create prints the user code for GUI approval.
 
 Configuration (environment variables, or a local .env file):
   VCFA_HOST                 e.g. automation.example.com (no scheme)
@@ -71,7 +71,7 @@ def load_dotenv(path: Path) -> None:
 def config(args: argparse.Namespace) -> dict:
     """Build the run configuration. Without --org the provider org is used.
 
-    One admin credential is used for whichever org is targeted: --user, --admin-token,
+    One admin credential is used for whichever org is targeted: --admin-user, --admin-token,
     or VCFA_ADMIN_REFRESH_TOKEN from the environment or .env. It must belong to the org
     being targeted. Service accounts are referred to by name; their client ids are
     looked up by name when needed, so no client id is needed here.
@@ -82,12 +82,12 @@ def config(args: argparse.Namespace) -> dict:
     is_provider = not org
 
     admin_refresh = (getattr(args, "admin_token", None) or os.environ.get("VCFA_ADMIN_REFRESH_TOKEN", "")).strip()
-    user = (getattr(args, "user", None) or os.environ.get("VCFA_USER", "")).strip()
-    if user and admin_refresh and getattr(args, "admin_token", None):
-        sys.exit("Use either --user (with a password) or an admin token, not both.")
+    admin_user = (getattr(args, "admin_user", None) or os.environ.get("VCFA_ADMIN_USER", "")).strip()
+    if admin_user and admin_refresh and getattr(args, "admin_token", None):
+        sys.exit("Use either --admin-user (with a password) or an admin token, not both.")
 
     name = (getattr(args, "name", None) or "").strip()
-    cfg = {"host": host, "org": org, "name": name, "admin_refresh": admin_refresh, "user": user}
+    cfg = {"host": host, "org": org, "name": name, "admin_refresh": admin_refresh, "admin_user": admin_user}
     if not host:
         sys.exit("Missing configuration: VCFA_HOST")
     if "://" in host:
@@ -227,8 +227,8 @@ def session_login(cfg: dict) -> str:
     auth. The session token comes back in the X-VMWARE-VCLOUD-ACCESS-TOKEN response header.
     The password is taken from VCFA_PASSWORD, or prompted for, and never printed.
     """
-    password = os.environ.get("VCFA_PASSWORD") or getpass.getpass(f"Password for {cfg['user']}: ")
-    cred = base64.b64encode(f"{cfg['user']}:{password}".encode()).decode()
+    password = os.environ.get("VCFA_PASSWORD") or getpass.getpass(f"Password for {cfg['admin_user']}: ")
+    cred = base64.b64encode(f"{cfg['admin_user']}:{password}".encode()).decode()
     path = "/cloudapi/1.0.0/sessions" if cfg["org"] else "/cloudapi/1.0.0/sessions/provider"
     headers = {"Authorization": f"Basic {cred}", "Accept": "application/*;version=9.0.0"}
     req = urllib.request.Request(f"https://{cfg['host']}{path}", method="POST", headers=headers)
@@ -241,7 +241,7 @@ def session_login(cfg: dict) -> str:
         sys.exit(f"Could not reach {path}: {exc.reason}")
     token = resp_headers.get("X-VMWARE-VCLOUD-ACCESS-TOKEN")
     if status != 200 or not token:
-        fail(f"Session login as {cfg['user']}", status, json.loads(raw) if raw[:1] == b"{" else {})
+        fail(f"Session login as {cfg['admin_user']}", status, json.loads(raw) if raw[:1] == b"{" else {})
     return token
 
 
@@ -251,11 +251,11 @@ def admin_bearer(cfg: dict) -> str:
     A JWT is used as-is, since it is already a bearer token. Anything else is treated as
     an API refresh token and exchanged for a short-lived bearer token.
     """
-    if cfg.get("user"):
+    if cfg.get("admin_user"):
         return session_login(cfg)
     token = cfg["admin_refresh"]
     if not token:
-        sys.exit("This command needs an admin token (VCFA_ADMIN_REFRESH_TOKEN or --admin-token) or a --user login.")
+        sys.exit("This command needs an admin token (VCFA_ADMIN_REFRESH_TOKEN or --admin-token) or an --admin-user login.")
     if is_jwt(token):
         exp = jwt_expiry(token)
         if exp is not None and exp <= time.time():
@@ -493,7 +493,7 @@ def build_parser() -> argparse.ArgumentParser:
     #   vcfa_sa.py create --org other-org --name my-svc
     org_opts = argparse.ArgumentParser(add_help=False)
     org_opts.add_argument("--org", help="tenant org to act in (default: the provider org)")
-    org_opts.add_argument("--user", help="log in as this user (e.g. admin@System) instead of using a token; "
+    org_opts.add_argument("--admin-user", help="log in as this admin user (e.g. admin@System) instead of using a token; "
                                          "the password is taken from VCFA_PASSWORD or prompted for")
     org_opts.add_argument("--admin-token", help="admin API token (default: VCFA_ADMIN_REFRESH_TOKEN); "
                                                 "prefer .env, as command-line args end up in shell history")
