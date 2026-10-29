@@ -109,6 +109,19 @@ Deletion may return 202, which means the server is processing it. Run `list` to 
 
 ### Certificates and hosts
 
+`--host` sets the VCF Automation host for one command. It overrides `VCFA_HOST`, so you can work
+with a second environment without editing `.env`.
+
+```sh
+./vcfa_sa.py list --host vcfa.yourdomain.com --admin-user admin@System             # host from the command line
+./vcfa_sa.py create --host vcfa-lab.yourdomain.com --name my-svc --admin-token YOUR_TOKEN
+./vcfa_sa.py create --host vcfa-lab.yourdomain.com --org planets --name my-svc --admin-user admin@Planets
+```
+
+Without `--host`, the value of `VCFA_HOST` from `.env` or the environment is used.
+
+TLS options:
+
 ```sh
 ./vcfa_sa.py list --ca-file /path/to/vcfa-ca.pem                # trust your private CA (preferred)
 ./vcfa_sa.py list --insecure                                    # skip verification (prints a warning)
